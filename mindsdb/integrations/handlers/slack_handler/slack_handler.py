@@ -1,9 +1,8 @@
 import os
+import json
 import datetime as dt
 from typing import List
 import pandas as pd
-import json
-
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode import SocketModeClient
@@ -34,9 +33,6 @@ DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 class SlackChannelListsTable(APIResource):
 
     def list(self, **kwargs) -> pd.DataFrame:
-
-        client = self.handler.connect()
-
         channels = self.handler.get_all_channels()
 
         for channel in channels:
@@ -51,6 +47,31 @@ class SlackChannelListsTable(APIResource):
             'name',
             'created_at',
             'updated_at'
+        ]
+
+
+class SlackUsersTable(APIResource):
+
+    def list(self, **kwargs) -> pd.DataFrame:
+        """
+        Retrieves list of users
+
+        The "users.list" call is used in slack api
+
+        :return: pd.DataFrame
+        """
+
+        client = self.handler.connect()
+
+        users = client.users_list().data['members']
+
+        return pd.DataFrame(users, columns=self.get_columns())
+
+    def get_columns(self) -> List[str]:
+        return [
+            'id',
+            'name',
+            'real_name'
         ]
 
 
@@ -96,14 +117,6 @@ class SlackChannelsTable(APIResource):
                 else:
                     raise ValueError(f"Channel '{value}' not found")
 
-            # Is this used?
-            # elif condition.column == 'limit':
-            #     if op == FilterOperator.EQUAL:
-            #         params['limit'] = int(value)
-            #         condition.applied = True
-            #     else:
-            #         raise NotImplementedError(f'Unknown op: {op}')
-
             elif condition.column == 'created_at' and value is not None:
                 date = parse_utc_date(value)
                 if op == FilterOperator.GREATER_THAN:
@@ -118,6 +131,9 @@ class SlackChannelsTable(APIResource):
 
         if limit:
             params['limit'] = limit
+
+        if 'channel' not in params:
+            raise Exception("To retrieve data from Slack, you need to provide the 'channel' parameter.")
 
         # Retrieve the conversation history
         result = client.conversations_history(**params)
@@ -199,7 +215,7 @@ class SlackChannelsTable(APIResource):
         client = self.handler.connect()
 
         # Get the channels list and ids
-        channels = client.conversations_list(types="public_channel,private_channel")['channels']
+        channels = self.handler.get_all_channels()
         channel_ids = {c['name']: c['id'] for c in channels}
 
         # Extract comparison conditions from the query
@@ -244,7 +260,7 @@ class SlackChannelsTable(APIResource):
             )
         except SlackApiError as e:
             raise Exception(f"Error updating message in Slack channel '{params['channel']}' with timestamp '{params['ts']}' and message '{params['text']}': {e.response['error']}")
-    
+
     def delete(self, query: ASTNode):
         """
         Deletes the message in the Slack Channel
@@ -310,9 +326,8 @@ class SlackHandler(APIChatHandler):
         super().__init__(name)
 
         args = kwargs.get('connection_data', {})
+        self.handler_storage = kwargs.get('handler_storage')
         self.connection_args = {}
-        self.handler_storage = kwargs['handler_storage']
-
         handler_config = Config().get('slack_handler', {})
         for k in ['token', 'app_token']:
             if k in args:
@@ -330,8 +345,10 @@ class SlackHandler(APIChatHandler):
         channel_lists = SlackChannelListsTable(self)
         self._register_table('channel_lists', channel_lists)
 
+        users = SlackUsersTable(self)
+        self._register_table('users', users)
+
         self._socket_mode_client = None
-        self.channels = None
 
     def get_chat_config(self):
         params = {
@@ -350,10 +367,25 @@ class SlackHandler(APIChatHandler):
         return params
 
     def get_my_user_name(self):
-        # TODO
-        api = self.connect()
-        resp = api.users_profile_get()
-        return resp.data['profile']['bot_id']
+        user_info = self._get_my_user_info()
+        return user_info['bot_id']
+    
+    def _get_my_user_id(self):
+        user_info = self._get_my_user_info()
+        return user_info['user_id']
+    
+    def _get_my_user_info(self):
+        try:
+            user_info = json.loads(self.handler_storage.file_get('user_info'))
+        except FileNotFoundError:
+            user_info = None
+
+        if not user_info:    
+            api = self.connect()
+            user_info = api.auth_test().data
+            self.handler_storage.file_set('user_info', json.dumps(user_info).encode('utf-8'))
+
+        return user_info
 
     def subscribe(self, stop_event, callback, table_name, **kwargs):
         if table_name != 'channels':
@@ -366,6 +398,8 @@ class SlackHandler(APIChatHandler):
             web_client=WebClient(token=self.connection_args['token']),  # xoxb-111-222-xyz
         )
 
+        my_user_id = self._get_my_user_id()
+
         def _process_websocket_message(client: SocketModeClient, request: SocketModeRequest):
             # Acknowledge the request
             response = SocketModeResponse(envelope_id=request.envelope_id)
@@ -374,17 +408,26 @@ class SlackHandler(APIChatHandler):
             if request.type != 'events_api':
                 return
 
+            # ignore duplicated requests
+            if request.retry_attempt is not None and request.retry_attempt > 0:
+                return
+
             payload_event = request.payload['event']
-            if payload_event['type'] != 'message':
+
+            if payload_event['type'] == 'message' and payload_event['channel_type'] != 'im':
+                # Avoid responding to messages in channels
                 return
+
+            if payload_event['type'] == 'app_mention' and my_user_id not in payload_event['text']:
+                # Avoid responding to app mentions not directed at the bot
+                return
+
             if 'subtype' in payload_event:
-                # Don't respond to message_changed, message_deleted, etc.
+                # Avoid responding to message_changed, message_deleted, etc.
                 return
-            if payload_event['channel_type'] != 'im':
-                # Only support IMs currently.
-                return
+
             if 'bot_id' in payload_event:
-                # A bot sent this message.
+                # Avoid responding to messages from bots
                 return
 
             key = {
@@ -393,6 +436,8 @@ class SlackHandler(APIChatHandler):
             row = {
                 'text': payload_event['text'],
                 'user': payload_event['user'],
+                'channel': payload_event['channel'],
+                'created_at': dt.datetime.fromtimestamp(float(payload_event['ts'])).strftime('%Y-%m-%d %H:%M:%S')
             }
 
             callback(row, key)
@@ -403,7 +448,6 @@ class SlackHandler(APIChatHandler):
         stop_event.wait()
 
         self._socket_mode_client.close()
-
 
     def create_connection(self):
         """
@@ -422,40 +466,6 @@ class SlackHandler(APIChatHandler):
 
         self.api = self.create_connection()
         return self.api
-    
-    def get_all_channels(self) -> List:
-        """
-        Get all channels.
-
-        Returns
-        -------
-        List[Dict]
-            The channels data.
-        """
-
-        if (self.channels):
-            return self.channels
-        
-        try:
-            self.channels = json.loads(self.handler_storage.file_get('channels'))
-            if (self.channels is not None and len(self.channels) > 0):
-                return self.channels
-        except:
-            pass
-
-        client = self.connect()
-
-        # Get the channels list and ids
-        response = client.conversations_list(types="public_channel,private_channel")
-        channels = response['channels']
-        while response["response_metadata"]["next_cursor"] != '':
-            cursor = response["response_metadata"]["next_cursor"]
-            response = client.conversations_list(cursor=cursor, types="public_channel,private_channel")
-            channels.extend(response['channels'])
-
-        self.channels = channels
-        self.handler_storage.file_set('channels', json.dumps(channels).encode('utf-8'))
-        return self.channels
 
     def check_connection(self):
         """
@@ -494,15 +504,6 @@ class SlackHandler(APIChatHandler):
         """
         method_name, params = FuncParser().from_string(query_string)
 
-        if (method_name == "refresh_channels"):
-            self.channels = None
-            self.handler_storage.file_set('channels', json.dumps([]).encode('utf-8'))
-            numChannels = len(self.get_all_channels())
-            return Response(
-                RESPONSE_TYPE.TABLE,
-                data_frame = pd.DataFrame({'num_channels': [numChannels]})
-            )
-        
         df = self.call_slack_api(method_name, params)
 
         return Response(
@@ -523,7 +524,7 @@ class SlackHandler(APIChatHandler):
         """
         api = self.connect()
         method = getattr(api, method_name)
-        
+
         try:
             result = method(**params)
 
@@ -536,6 +537,37 @@ class SlackHandler(APIChatHandler):
             result['channels'] = self.convert_channel_data(result['channels'])
 
         return [result]
+    
+    def get_all_channels(self) -> List:
+        """
+        Get all channels in the workspace by paginating through the response.
+
+        Returns
+        -------
+        List[Dict]
+            The channels data.
+        """
+        # Get the channels from the handler storage if available
+        try:
+            channels = json.loads(self.handler_storage.file_get('channels'))
+        except FileNotFoundError:
+            channels = None
+
+        if not channels:
+            client = self.connect()
+
+            response = client.conversations_list(types="public_channel,private_channel")
+            channels = response['channels']
+            # Paginate through the response
+            while response["response_metadata"]["next_cursor"] != '':
+                cursor = response["response_metadata"]["next_cursor"]
+                response = client.conversations_list(cursor=cursor, types="public_channel,private_channel")
+                channels.extend(response['channels'])
+
+            # Store the channels in the handler storage
+            self.handler_storage.file_set('channels', json.dumps(channels).encode('utf-8'))
+
+        return channels
 
     def convert_channel_data(self, channels: List[dict]):
         """
