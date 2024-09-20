@@ -36,7 +36,7 @@ CREATE MODEL wayback_machine_model
 PREDICT answer
 USING
       engine = 'sema4ai_engine',
-      assistant_name = 'Wayback Machine Agent';
+      agent_name = 'Wayback Machine Agent';
 
 CREATE AGENT wayback_machine_agent
 USING
@@ -67,4 +67,3 @@ Here is the output:
 | me know what you need!                                        |                                 |
 +---------------------------------------------------------------+---------------------------------+
 ```
-

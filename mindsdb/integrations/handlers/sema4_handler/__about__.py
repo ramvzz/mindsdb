@@ -1,6 +1,6 @@
 __title__ = 'Sema4.AI handler'
 __package_name__ = 'mindsdb_sema4_handler'
-__version__ = '0.0.1'
+__version__ = '0.0.2'
 __description__ = "MindsDB handler for Sema4"
 __author__ = 'Sema4.AI Inc'
 __github__ = 'https://github.com/mindsdb/mindsdb'

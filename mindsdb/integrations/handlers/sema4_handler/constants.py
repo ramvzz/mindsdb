@@ -1,1 +1,1 @@
-DEFAULT_ASSISTANT_SERVER_API_BASE: str = 'http://localhost:8000'
+DEFAULT_AGENT_SERVER_API_BASE: str = 'http://localhost:8000'
