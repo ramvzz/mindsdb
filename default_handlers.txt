@@ -5,7 +5,7 @@ mariadb
 scylla
 cassandra
 clickhouse
-# snowflake
+snowflake
 slack
 sqlite
 mongodb
@@ -21,3 +21,6 @@ langchain            # For agents & completions
 sema4
 pgvector
 confluence
+teams
+redshift
+lightwood
