@@ -25,4 +25,4 @@ jobs:
     - name: Build and push Docker image
       run: |
         # Navigate to the directory containing the Dockerfile
-        docker buildx build --platform linux/amd64,linux/arm64 --tag sema4ai/sema4ai-data-server:test --push --file docker/mindsdb.Dockerfile .
+        docker buildx build --platform linux/amd64,linux/arm64 --tag sema4ai/sema4ai-data-server:latest --push --file docker/mindsdb.Dockerfile .
