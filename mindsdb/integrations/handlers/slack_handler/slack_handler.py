@@ -30,7 +30,7 @@ logger = log.getLogger(__name__)
 DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
 
-class SlackChannelListsTable(APIResource):
+class SlackConversationsTable(APIResource):
 
     def list(self, **kwargs) -> pd.DataFrame:
         channels = self.handler.get_all_channels()
@@ -45,8 +45,19 @@ class SlackChannelListsTable(APIResource):
         return [
             'id',
             'name',
+            'is_channel',
+            'is_group',
+            'is_im',
+            'is_mpim',
+            'is_private',
+            'is_archived',
+            'is_general',
+            'is_shared',
+            'is_ext_shared',
+            'is_org_shared',
+            'creator',
             'created_at',
-            'updated_at'
+            'updated_at',
         ]
 
 
@@ -75,12 +86,13 @@ class SlackUsersTable(APIResource):
         ]
 
 
-class SlackChannelsTable(APIResource):
+class SlackMessagesTable(APIResource):
 
     def list(self,
-             conditions: List[FilterCondition] = None,
-             limit: int = None,
-             **kwargs) -> pd.DataFrame:
+        conditions: List[FilterCondition] = None,
+        limit: int = None,
+        **kwargs
+    ) -> pd.DataFrame:
         """
         Retrieves the data from the channel using SlackAPI
 
@@ -109,12 +121,16 @@ class SlackChannelsTable(APIResource):
             value = condition.value
             op = condition.op
 
-            if condition.column == 'channel':
-                if value in channel_ids:
-                    params['channel'] = channel_ids[value]
-                    channel_name = value
+            if condition.column == 'channel_id':
+                if op != FilterOperator.EQUAL:
+                    raise ValueError(f"Unsupported operator '{op}' for column 'channel_id'")
+
+                # Check if the channel exists
+                try:
+                    channel = self.handler.get_channel(value)
+                    params['channel'] = value
                     condition.applied = True
-                else:
+                except SlackApiError as e:
                     raise ValueError(f"Channel '{value}' not found")
 
             elif condition.column == 'created_at' and value is not None:
@@ -145,7 +161,8 @@ class SlackChannelsTable(APIResource):
         result = result[result['text'].notnull()]
 
         # Add the selected channel to the dataframe
-        result['channel'] = channel_name
+        result['channel_id'] = params['channel']
+        result['channel_name'] = channel['name'] if 'name' in channel else None
 
         # translate the time stamp into a 'created_at' field
         result['created_at'] = pd.to_datetime(result['ts'].astype(float), unit='s').dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -154,6 +171,7 @@ class SlackChannelsTable(APIResource):
 
     def get_columns(self) -> List[str]:
         return [
+            'channel_id',
             'channel',
             'client_msg_id',
             'type',
@@ -188,13 +206,13 @@ class SlackChannelsTable(APIResource):
             params = dict(zip(columns, row))
 
             # check if required parameters are provided
-            if 'channel' not in params or 'text' not in params:
-                raise Exception("To insert data into Slack, you need to provide the 'channel' and 'text' parameters.")
+            if 'channel_id' not in params or 'text' not in params:
+                raise Exception("To insert data into Slack, you need to provide the 'channel_id' and 'text' parameters.")
 
             # post message to Slack channel
             try:
                 response = client.chat_postMessage(
-                    channel=params['channel'],
+                    channel=params['channel_id'],
                     text=params['text']
                 )
             except SlackApiError as e:
@@ -228,10 +246,12 @@ class SlackChannelsTable(APIResource):
 
         # Build the filters and parameters for the query
         for op, arg1, arg2 in conditions:
-            if arg1 == 'channel':
-                if arg2 in channel_ids:
-                    params['channel'] = channel_ids[arg2]
-                else:
+            if arg1 == 'channel_id':
+                # Check if the channel exists
+                try:
+                    self.handler.get_channel(arg2)
+                    params['channel'] = arg2
+                except SlackApiError as e:
                     raise ValueError(f"Channel '{arg2}' not found")
 
             if keys[0] == 'text':
@@ -282,10 +302,12 @@ class SlackChannelsTable(APIResource):
 
         # Build the filters and parameters for the query
         for op, arg1, arg2 in conditions:
-            if arg1 == 'channel':
-                if arg2 in channel_ids:
-                    params['channel'] = channel_ids[arg2]
-                else:
+            if arg1 == 'channel_id':
+                # Check if the channel exists
+                try:
+                    self.handler.get_channel(arg2)
+                    params['channel'] = arg2
+                except SlackApiError as e:
                     raise ValueError(f"Channel '{arg2}' not found")
 
             if arg1 == 'ts':
@@ -339,11 +361,11 @@ class SlackHandler(APIChatHandler):
         self.api = None
         self.is_connected = False
         
-        channels = SlackChannelsTable(self)
-        self._register_table('channels', channels)
+        channels = SlackMessagesTable(self)
+        self._register_table('messages', channels)
 
-        channel_lists = SlackChannelListsTable(self)
-        self._register_table('channel_lists', channel_lists)
+        channel_lists = SlackConversationsTable(self)
+        self._register_table('conversations', channel_lists)
 
         users = SlackUsersTable(self)
         self._register_table('users', users)
@@ -354,11 +376,11 @@ class SlackHandler(APIChatHandler):
         params = {
             'polling': {
                 'type': 'realtime',
-                'table_name': 'channels'
+                'table_name': 'messages'
             },
             'chat_table': {
-                'name': 'channels',
-                'chat_id_col': 'channel',
+                'name': 'messages',
+                'chat_id_col': 'channel_id',
                 'username_col': 'user',
                 'text_col': 'text',
                 'time_col': 'thread_ts',
@@ -388,7 +410,7 @@ class SlackHandler(APIChatHandler):
         return user_info
 
     def subscribe(self, stop_event, callback, table_name, **kwargs):
-        if table_name != 'channels':
+        if table_name != 'messages':
             raise RuntimeError(f'Table not supported: {table_name}')
 
         self._socket_mode_client = SocketModeClient(
@@ -408,18 +430,14 @@ class SlackHandler(APIChatHandler):
             if request.type != 'events_api':
                 return
 
-            # ignore duplicated requests
+            # Ignore duplicated requests
             if request.retry_attempt is not None and request.retry_attempt > 0:
                 return
 
             payload_event = request.payload['event']
 
-            if payload_event['type'] == 'message' and payload_event['channel_type'] != 'im':
-                # Avoid responding to messages in channels
-                return
-
-            if payload_event['type'] == 'app_mention' and my_user_id not in payload_event['text']:
-                # Avoid responding to app mentions not directed at the bot
+            if payload_event['type'] not in ('message', 'app_mention'):
+                # TODO: Refresh the channels cache
                 return
 
             if 'subtype' in payload_event:
@@ -427,16 +445,16 @@ class SlackHandler(APIChatHandler):
                 return
 
             if 'bot_id' in payload_event:
-                # Avoid responding to messages from bots
+                # Avoid responding to messages from the bot
                 return
 
             key = {
-                'channel': payload_event['channel'],
+                'channel_id': payload_event['channel'],
             }
             row = {
                 'text': payload_event['text'],
                 'user': payload_event['user'],
-                'channel': payload_event['channel'],
+                'channel_id': payload_event['channel'],
                 'created_at': dt.datetime.fromtimestamp(float(payload_event['ts'])).strftime('%Y-%m-%d %H:%M:%S')
             }
 
